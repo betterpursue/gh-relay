@@ -1,0 +1,120 @@
+name: fetch-release
+
+# Downloads a GitHub release asset on Microsoft's runner (fast uplink),
+# then hands it to you as an Actions artifact (served from Azure).
+# Nothing is built; this is purely a download relay.
+
+on:
+  workflow_dispatch:
+    inputs:
+      repo:
+        description: 'owner/name'
+        required: true
+        default: 'liliMozi/openhanako'
+      tag:
+        description: 'release tag'
+        required: true
+        default: 'v1.5.118-beta'
+      asset:
+        description: 'exact asset filename'
+        required: true
+        default: 'HanaAgent-1.5.118-beta-Windows-x64.exe'
+      sha256:
+        description: 'expected sha256 (leave empty to read SHA256SUMS.txt from the release)'
+        required: false
+        default: ''
+      split_mb:
+        description: 'split the file into parts of N MB (0 = keep whole)'
+        required: false
+        default: '0'
+
+permissions:
+  contents: read
+
+jobs:
+  relay:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      REPO: ${{ inputs.repo }}
+      TAG: ${{ inputs.tag }}
+      ASSET: ${{ inputs.asset }}
+      WANT_SHA: ${{ inputs.sha256 }}
+      SPLIT_MB: ${{ inputs.split_mb }}
+    steps:
+      - name: Download from GitHub
+        run: |
+          set -euo pipefail
+          url="https://github.com/${REPO}/releases/download/${TAG}/${ASSET}"
+          echo "URL: $url"
+          mkdir -p out
+          curl -fL --retry 10 --retry-all-errors --retry-delay 3 \
+               --connect-timeout 20 --max-time 1800 \
+               -o "out/${ASSET}" "$url"
+          ls -l out
+          echo "SIZE=$(stat -c%s "out/${ASSET}")" >> "$GITHUB_ENV"
+
+      - name: Resolve expected sha256
+        run: |
+          set -euo pipefail
+          want="$WANT_SHA"
+          if [ -z "$want" ]; then
+            sums="https://github.com/${REPO}/releases/download/${TAG}/SHA256SUMS.txt"
+            if curl -fsSL --retry 5 -o sums.txt "$sums"; then
+              want=$(awk -v a="$ASSET" '$2==a || $2=="*"a {print $1}' sums.txt | head -n1)
+              echo "read from SHA256SUMS.txt"
+            fi
+          fi
+          if [ -z "$want" ]; then
+            echo "no expected hash available, skipping verification"
+            echo "WANT_SHA=" >> "$GITHUB_ENV"
+          else
+            echo "WANT_SHA=$want" >> "$GITHUB_ENV"
+          fi
+
+      - name: Verify sha256
+        run: |
+          set -euo pipefail
+          got=$(sha256sum "out/${ASSET}" | awk '{print $1}')
+          echo "got : $got"
+          echo "want: ${WANT_SHA:-<none>}"
+          if [ -n "${WANT_SHA:-}" ] && [ "$got" != "$WANT_SHA" ]; then
+            echo "::error::sha256 mismatch"
+            exit 1
+          fi
+          echo "GOT_SHA=$got" >> "$GITHUB_ENV"
+
+      - name: Split into parts
+        run: |
+          set -euo pipefail
+          if [ "$SPLIT_MB" != "0" ]; then
+            cd out
+            split -b "${SPLIT_MB}M" -d -a 2 "${ASSET}" "${ASSET}.part"
+            rm -f "${ASSET}"
+            ls -l
+          fi
+
+      - name: Summary
+        run: |
+          {
+            echo "### relay ok"
+            echo ""
+            echo "| field | value |"
+            echo "|---|---|"
+            echo "| repo | \`${REPO}\` |"
+            echo "| tag | \`${TAG}\` |"
+            echo "| asset | \`${ASSET}\` |"
+            echo "| bytes | ${SIZE} |"
+            echo "| sha256 | \`${GOT_SHA}\` |"
+            echo "| split | ${SPLIT_MB} MB |"
+            echo ""
+            echo "Download it from the **Artifacts** section at the bottom of this run page."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: relay-${{ github.run_number }}
+          path: out/
+          compression-level: 0
+          retention-days: 7
